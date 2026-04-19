@@ -24,11 +24,12 @@ DEFAULT_CONFIG = {
     "max_recur_limit": 100,
     # Data vendor configuration
     # Category-level configuration (default for all tools in category)
+    # 修改 default_config.py
     "data_vendors": {
-        "core_stock_apis": "yfinance",       # Options: alpha_vantage, yfinance
-        "technical_indicators": "yfinance",  # Options: alpha_vantage, yfinance
-        "fundamental_data": "yfinance",      # Options: alpha_vantage, yfinance
-        "news_data": "yfinance",             # Options: alpha_vantage, yfinance
+        "core_stock_apis": "china,yfinance",       # 优先使用中国数据源，然后 fallback 到 yfinance
+        "technical_indicators": "china,yfinance",  # 优先使用中国数据源，然后 fallback 到 yfinance
+        "fundamental_data": "china,yfinance",      # 优先使用中国数据源，然后 fallback 到 yfinance
+        "news_data": "yfinance",                   # 新闻数据仍然使用 yfinance
     },
     # Tool-level configuration (takes precedence over category-level)
     "tool_vendors": {
