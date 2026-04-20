@@ -4,6 +4,8 @@ from dateutil.relativedelta import relativedelta
 import pandas as pd
 import os
 import sys
+import threading
+import time as _time
 
 # 尝试导入国内数据源库
 try:
@@ -22,6 +24,21 @@ except ImportError:
     bs = None
 
 from .stockstats_utils import _clean_dataframe, yf_retry, load_ohlcv, filter_financials_by_date
+
+_china_stock_data_cache = {}
+_china_stock_data_cache_lock = threading.Lock()
+_baostock_lock = threading.Lock()
+
+
+def _get_cached_china_stock_data(symbol, start_date, end_date):
+    cache_key = f"{symbol}_{start_date}_{end_date}"
+    with _china_stock_data_cache_lock:
+        if cache_key in _china_stock_data_cache:
+            return _china_stock_data_cache[cache_key]
+    result = get_china_stock_data(symbol, start_date, end_date)
+    with _china_stock_data_cache_lock:
+        _china_stock_data_cache[cache_key] = result
+    return result
 
 def get_china_stock_data(
     symbol: Annotated[str, "ticker symbol of the company"],
@@ -127,42 +144,41 @@ def _get_akshare_data(symbol, start_date, end_date):
 
 def _get_baostock_data(symbol, start_date, end_date):
     """使用 BaoStock 获取股票数据"""
+    if bs is None:
+        return "Error: BaoStock not installed"
+    if not _baostock_lock.acquire(timeout=30):
+        return "Error: BaoStock is busy, try again later"
     try:
-        # 处理股票代码格式（ BaoStock 格式：sh.600519）
         code = symbol
         if symbol.endswith('.SH'):
             code = "sh." + symbol.replace('.SH', '')
         elif symbol.endswith('.SZ'):
             code = "sz." + symbol.replace('.SZ', '')
         
-        # 登录 BaoStock
         lg = bs.login()
         if lg.error_code != '0':
             return f"BaoStock login failed: {lg.error_msg}"
         
-        # 获取股票历史数据
-        rs = bs.query_history_k_data_plus(
-            code=code,
-            fields="date,open,high,low,close,volume",
-            start_date=start_date,
-            end_date=end_date,
-            frequency="d",
-            adjustflag="3"
-        )
-        
-        # 转换为 DataFrame
-        data_list = []
-        while (rs.error_code == '0') & rs.next():
-            data_list.append(rs.get_row_data())
-        df = pd.DataFrame(data_list, columns=rs.fields)
-        
-        # 登出
-        bs.logout()
+        try:
+            rs = bs.query_history_k_data_plus(
+                code=code,
+                fields="date,open,high,low,close,volume",
+                start_date=start_date,
+                end_date=end_date,
+                frequency="d",
+                adjustflag="3"
+            )
+            
+            data_list = []
+            while (rs.error_code == '0') & rs.next():
+                data_list.append(rs.get_row_data())
+            df = pd.DataFrame(data_list, columns=rs.fields)
+        finally:
+            bs.logout()
         
         if df.empty:
             return f"No data found for symbol '{symbol}' between {start_date} and {end_date}"
         
-        # 重命名列
         df = df.rename(columns={
             'date': 'Date',
             'open': 'Open',
@@ -172,7 +188,6 @@ def _get_baostock_data(symbol, start_date, end_date):
             'volume': 'Volume'
         })
         
-        # 转换数据类型
         df['Date'] = pd.to_datetime(df['Date'])
         df['Open'] = pd.to_numeric(df['Open'])
         df['High'] = pd.to_numeric(df['High'])
@@ -183,10 +198,8 @@ def _get_baostock_data(symbol, start_date, end_date):
         df = df.set_index('Date')
         df = df.sort_index()
         
-        # 转换为 CSV 字符串
         csv_string = df.to_csv()
         
-        # 添加头部信息
         header = f"# Stock data for {symbol} from {start_date} to {end_date}\n"
         header += f"# Total records: {len(df)}\n"
         header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
@@ -194,6 +207,8 @@ def _get_baostock_data(symbol, start_date, end_date):
         return header + csv_string
     except Exception as e:
         return f"Error with BaoStock: {str(e)}"
+    finally:
+        _baostock_lock.release()
 
 def _get_baostock_fundamentals(ticker, curr_date):
     """使用 BaoStock 获取基本面数据"""
@@ -434,37 +449,46 @@ def get_china_indicators(
 ) -> str:
     """获取中国股票技术指标"""
     try:
-        # 先获取股票数据
         end_date = curr_date
         curr_date_dt = datetime.strptime(curr_date, "%Y-%m-%d")
+
+        sma_window = None
+        if indicator == 'close_50_sma':
+            sma_window = 50
+        elif indicator == 'close_200_sma':
+            sma_window = 200
+        if sma_window is not None:
+            trading_days_needed = int(sma_window * 1.8)
+            calendar_days_needed = int(trading_days_needed * 1.5)
+            if look_back_days < calendar_days_needed:
+                look_back_days = calendar_days_needed
+
         start_date = (curr_date_dt - relativedelta(days=look_back_days)).strftime("%Y-%m-%d")
-        
-        # 检查日期是否是未来日期
+
         today = datetime.now().strftime("%Y-%m-%d")
         if end_date > today:
             end_date = today
-        
-        # 获取股票数据
-        stock_data = get_china_stock_data(symbol, start_date, end_date)
-        
-        # 解析 CSV 数据
+
+        stock_data = _get_cached_china_stock_data(symbol, start_date, end_date)
+
+        if stock_data.startswith("Error:") or stock_data.startswith("No data found"):
+            return f"No data available for {symbol}: {stock_data}"
+
         lines = stock_data.split('\n')
         csv_lines = [line for line in lines if not line.startswith('#') and line.strip()]
         if not csv_lines:
             return f"No data available for {symbol}"
-        
-        # 构建 DataFrame
+
         df = pd.read_csv(pd.io.common.StringIO('\n'.join(csv_lines)))
         if 'Date' not in df.columns:
             return f"Error: 'Date' column not found in data for {symbol}"
-        
+
         df['Date'] = pd.to_datetime(df['Date'])
         df = df.set_index('Date')
-        
-        # 计算技术指标
+        df = df.sort_index()
+
         result_str = f"## {indicator} values from {start_date} to {end_date}:\n\n"
 
-        # 简单移动平均线
         if indicator == 'close_50_sma':
             df['SMA50'] = df['Close'].rolling(window=50).mean()
             for date, row in df.iterrows():
@@ -475,7 +499,6 @@ def get_china_indicators(
             for date, row in df.iterrows():
                 if not pd.isna(row['SMA200']):
                     result_str += f"{date.strftime('%Y-%m-%d')}: {row['SMA200']:.2f}\n"
-        # RSI 指标
         elif indicator == 'rsi':
             delta = df['Close'].diff()
             gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
@@ -486,7 +509,6 @@ def get_china_indicators(
             for date, row in df.iterrows():
                 if not pd.isna(row['RSI']):
                     result_str += f"{date.strftime('%Y-%m-%d')}: {row['RSI']:.2f}\n"
-        # MACD 指标
         elif indicator in ['macd', 'macds', 'macdh']:
             exp12 = df['Close'].ewm(span=12, adjust=False).mean()
             exp26 = df['Close'].ewm(span=26, adjust=False).mean()
@@ -503,7 +525,6 @@ def get_china_indicators(
                     result_str += f"{date.strftime('%Y-%m-%d')}: {row['MACD_Signal']:.2f}\n"
                 elif indicator == 'macdh' and not pd.isna(row['MACD_Hist']):
                     result_str += f"{date.strftime('%Y-%m-%d')}: {row['MACD_Hist']:.2f}\n"
-        # ATR 指标
         elif indicator == 'atr':
             high_low = df['High'] - df['Low']
             high_close = (df['High'] - df['Close'].shift()).abs()
@@ -514,7 +535,6 @@ def get_china_indicators(
             for date, row in df.iterrows():
                 if not pd.isna(row['ATR']):
                     result_str += f"{date.strftime('%Y-%m-%d')}: {row['ATR']:.2f}\n"
-        # 布林带指标
         elif indicator in ['boll', 'boll_ub', 'boll_lb']:
             middle_band = df['Close'].rolling(window=20).mean()
             std_dev = df['Close'].rolling(window=20).std()
@@ -530,7 +550,15 @@ def get_china_indicators(
                     result_str += f"{date.strftime('%Y-%m-%d')}: {row['Bollinger_Upper']:.2f}\n"
                 elif indicator == 'boll_lb' and not pd.isna(row['Bollinger_Lower']):
                     result_str += f"{date.strftime('%Y-%m-%d')}: {row['Bollinger_Lower']:.2f}\n"
-        # EMA 指标
+        elif indicator == 'vwma':
+            if 'Volume' in df.columns:
+                vwma_window = 20
+                df['VWMA'] = (df['Close'] * df['Volume']).rolling(window=vwma_window).sum() / df['Volume'].rolling(window=vwma_window).sum()
+                for date, row in df.iterrows():
+                    if not pd.isna(row['VWMA']):
+                        result_str += f"{date.strftime('%Y-%m-%d')}: {row['VWMA']:.2f}\n"
+            else:
+                result_str += f"Indicator vwma not supported: Volume data not available for {symbol}"
         elif indicator.startswith('close_') and indicator.endswith('_ema'):
             try:
                 window = int(indicator.replace('close_', '').replace('_ema', ''))
