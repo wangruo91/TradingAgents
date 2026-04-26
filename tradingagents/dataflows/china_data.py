@@ -600,14 +600,158 @@ def get_china_income_statement(
     return f"Income statement data not yet implemented for China stocks"
 
 def get_china_news(
-    ticker: Annotated[str, "ticker symbol of the company"]
+    ticker: Annotated[str, "ticker symbol of the company"],
+    start_date: Annotated[str, "Start date in yyyy-mm-dd format"],
+    end_date: Annotated[str, "End date in yyyy-mm-dd format"],
 ):
-    """获取中国股票新闻"""
-    return f"News data not yet implemented for China stocks"
+    """获取中国股票新闻（东方财富个股新闻 + 财联社全球新闻）"""
+    if ak is None:
+        return "Error: akshare not installed, cannot fetch China stock news"
 
-def get_china_global_news():
-    """获取中国市场全球新闻"""
-    return f"Global news data not yet implemented for China market"
+    tried_sources = []
+
+    clean_ticker = ticker
+    if ticker.endswith('.SH'):
+        clean_ticker = ticker.replace('.SH', '')
+    elif ticker.endswith('.SZ'):
+        clean_ticker = ticker.replace('.SZ', '')
+    elif ticker.endswith('.SS'):
+        clean_ticker = ticker.replace('.SS', '')
+
+    try:
+        df = ak.stock_news_em(symbol=clean_ticker)
+        if df is not None and not df.empty:
+            start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+            end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+
+            news_str = ""
+            filtered_count = 0
+
+            for _, row in df.iterrows():
+                title = row.get('新闻标题', 'No title')
+                content = row.get('新闻内容', '')
+                source = row.get('文章来源', 'Unknown')
+                pub_time_str = str(row.get('发布时间', ''))
+                link = row.get('新闻链接', '')
+
+                pub_date = None
+                try:
+                    pub_date = datetime.strptime(pub_time_str[:10], "%Y-%m-%d")
+                except (ValueError, IndexError):
+                    pass
+
+                if pub_date and not (start_dt <= pub_date <= end_dt + relativedelta(days=1)):
+                    continue
+
+                news_str += f"### {title} (source: {source})\n"
+                if content:
+                    news_str += f"{content}\n"
+                if link:
+                    news_str += f"Link: {link}\n"
+                if pub_time_str:
+                    news_str += f"Published: {pub_time_str}\n"
+                news_str += "\n"
+                filtered_count += 1
+
+            if filtered_count > 0:
+                header = f"## {ticker} News (东方财富), from {start_date} to {end_date}:\n\n"
+                return header + news_str
+
+            tried_sources.append(f"stock_news_em: {filtered_count} articles in date range (total {len(df)})")
+        else:
+            tried_sources.append("stock_news_em: no data returned")
+    except Exception as e:
+        tried_sources.append(f"stock_news_em: {str(e)[:80]}")
+
+    try:
+        global_news = get_china_global_news_inner(end_date, look_back_days=7, limit=10)
+        if global_news and not global_news.startswith("No ") and not global_news.startswith("Error"):
+            return f"## {ticker} News (财经宏观新闻), from {start_date} to {end_date}:\n\nNo stock-specific news found. Below are recent financial news that may be relevant:\n\n{global_news}"
+    except Exception as e:
+        tried_sources.append(f"global_news fallback: {str(e)[:80]}")
+
+    return f"No news found for {ticker} between {start_date} and {end_date}. Tried: {tried_sources}"
+
+
+def get_china_global_news(
+    curr_date: Annotated[str, "Current date in yyyy-mm-dd format"],
+    look_back_days: Annotated[int, "Number of days to look back"] = 7,
+    limit: Annotated[int, "Maximum number of articles to return"] = 5,
+):
+    """获取中国及全球宏观财经新闻"""
+    return get_china_global_news_inner(curr_date, look_back_days, limit)
+
+
+def get_china_global_news_inner(curr_date, look_back_days=7, limit=5):
+    """内部实现：获取全球宏观财经新闻"""
+    if ak is None:
+        return "Error: akshare not installed, cannot fetch China global news"
+
+    tried_sources = []
+    all_news_items = []
+
+    try:
+        df = ak.stock_info_global_em()
+        if df is not None and not df.empty:
+            start_dt = datetime.strptime(curr_date, "%Y-%m-%d") - relativedelta(days=look_back_days)
+            count = 0
+            for _, row in df.iterrows():
+                title = row.get('标题', 'No title')
+                summary = row.get('摘要', '')
+                pub_time_str = str(row.get('发布时间', ''))
+                link = row.get('链接', '')
+
+                all_news_items.append({
+                    'title': title,
+                    'summary': summary,
+                    'source': '东方财富全球财经',
+                    'pub_time': pub_time_str,
+                    'link': link,
+                })
+                count += 1
+                if count >= limit * 3:
+                    break
+        else:
+            tried_sources.append("stock_info_global_em: no data")
+    except Exception as e:
+        tried_sources.append(f"stock_info_global_em: {str(e)[:80]}")
+
+    try:
+        df_cctv = ak.news_cctv(date=curr_date.replace('-', ''))
+        if df_cctv is not None and not df_cctv.empty:
+            for _, row in df_cctv.iterrows():
+                title = row.get('title', row.get('标题', 'No title'))
+                content = row.get('content', row.get('内容', ''))
+                all_news_items.append({
+                    'title': title,
+                    'summary': content[:300] if content else '',
+                    'source': '新闻联播',
+                    'pub_time': curr_date,
+                    'link': '',
+                })
+                if len(all_news_items) >= limit * 5:
+                    break
+    except Exception as e:
+        tried_sources.append(f"news_cctv: {str(e)[:80]}")
+
+    if not all_news_items:
+        if tried_sources:
+            return f"No global news found for {curr_date}. Tried: {tried_sources}"
+        return f"No global news found for {curr_date}"
+
+    start_date = (datetime.strptime(curr_date, "%Y-%m-%d") - relativedelta(days=look_back_days)).strftime("%Y-%m-%d")
+    news_str = ""
+    for item in all_news_items[:limit]:
+        news_str += f"### {item['title']} (source: {item['source']})\n"
+        if item['summary']:
+            news_str += f"{item['summary']}\n"
+        if item['link']:
+            news_str += f"Link: {item['link']}\n"
+        if item['pub_time']:
+            news_str += f"Published: {item['pub_time']}\n"
+        news_str += "\n"
+
+    return f"## Global Market News (东方财富/新闻联播), from {start_date} to {curr_date}:\n\n{news_str}"
 
 def get_china_insider_transactions(
     ticker: Annotated[str, "ticker symbol of the company"]

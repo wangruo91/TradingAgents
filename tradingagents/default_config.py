@@ -29,7 +29,7 @@ DEFAULT_CONFIG = {
         "core_stock_apis": "china,yfinance",       # 优先使用中国数据源，然后 fallback 到 yfinance
         "technical_indicators": "china,yfinance",  # 优先使用中国数据源，然后 fallback 到 yfinance
         "fundamental_data": "china,yfinance",      # 优先使用中国数据源，然后 fallback 到 yfinance
-        "news_data": "yfinance",                   # 新闻数据仍然使用 yfinance
+        "news_data": "china,yfinance",                   # 新闻数据优先使用中国数据源（东方财富），然后 fallback 到 yfinance
     },
     # Tool-level configuration (takes precedence over category-level)
     "tool_vendors": {
